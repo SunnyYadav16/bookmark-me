@@ -1,0 +1,57 @@
+{
+  "name": "codebookmark",
+  "version": "1.0.0",
+  "description": "Personal offline code snippet bookmark manager",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "electron-builder",
+    "build-arm64": "electron-builder --arm64"
+  },
+  "build": {
+    "appId": "com.codebookmark.app",
+    "productName": "CodeBookmark",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "node_modules/**/*"
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64", "x64"]
+        }
+      ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["arm64", "x64"]
+        }
+      ]
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": ["arm64", "x64"]
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0",
+    "fuse.js": "^7.0.0",
+    "natural": "^6.0.0",
+    "similarity": "^1.2.1"
+  }
+}
