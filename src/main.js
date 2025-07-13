@@ -3,6 +3,238 @@ const path = require('path');
 const Store = require('electron-store');
 const natural = require('natural');
 const similarity = require('similarity');
+const axios = require('axios');
+const { spawn } = require('child_process');
+
+class PythonLLMService {
+  constructor() {
+    this.serviceUrl = 'http://127.0.0.1:5000';
+    this.isAvailable = false;
+    this.pythonProcess = null;
+    this.initializationAttempts = 0;
+    this.maxInitAttempts = 10;
+
+    // Start Python service
+    this.startPythonService();
+  }
+
+  startPythonService() {
+    try {
+      console.log('🚀 Starting Python LLM service...');
+
+      // Determine Python executable path
+      const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+
+      // Path to your Python LLM service script
+      const servicePath = path.join(__dirname, '..', 'llm_service.py');
+
+      // Start Python service with your preferred model
+      this.pythonProcess = spawn(pythonCmd, [
+        servicePath,
+        '--model', 'deepseek_7b',  // or 'gemma-3_1b'
+        '--processor', 'cpu',      // or 'npu' for Snapdragon
+        '--port', '5000'
+      ], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: false
+      });
+
+      this.pythonProcess.stdout.on('data', (data) => {
+        console.log(`Python LLM: ${data.toString().trim()}`);
+      });
+
+      this.pythonProcess.stderr.on('data', (data) => {
+        console.error(`Python LLM Error: ${data.toString().trim()}`);
+      });
+
+      this.pythonProcess.on('close', (code) => {
+        console.log(`Python LLM service exited with code ${code}`);
+        this.isAvailable = false;
+      });
+
+      // Wait for service to start, then check connection
+      setTimeout(() => {
+        this.checkConnection();
+      }, 3000);
+
+    } catch (error) {
+      console.error('Failed to start Python LLM service:', error);
+      this.isAvailable = false;
+    }
+  }
+
+  async checkConnection() {
+    try {
+      const response = await axios.get(`${this.serviceUrl}/status`, { timeout: 5000 });
+
+      if (response.data.available) {
+        this.isAvailable = true;
+        console.log('✅ Python LLM service connected:', response.data.model);
+        return true;
+      } else {
+        console.log('⏳ Python LLM service loading...');
+
+        // Retry connection
+        if (this.initializationAttempts < this.maxInitAttempts) {
+          this.initializationAttempts++;
+          setTimeout(() => this.checkConnection(), 2000);
+        }
+        return false;
+      }
+    } catch (error) {
+      console.log('🔴 Python LLM service not available:', error.message);
+
+      // Retry connection
+      if (this.initializationAttempts < this.maxInitAttempts) {
+        this.initializationAttempts++;
+        setTimeout(() => this.checkConnection(), 2000);
+      }
+
+      this.isAvailable = false;
+      return false;
+    }
+  }
+
+  async analyzeCode(content) {
+    if (!this.isAvailable) {
+      await this.checkConnection();
+      if (!this.isAvailable) return null;
+    }
+
+    try {
+      const response = await axios.post(`${this.serviceUrl}/analyze`, {
+        content: content
+      }, { timeout: 30000 });
+
+      return response.data;
+    } catch (error) {
+      console.error('LLM analysis error:', error);
+      return null;
+    }
+  }
+
+  async explainCode(content) {
+    if (!this.isAvailable) return 'LLM service not available';
+
+    try {
+      const response = await axios.post(`${this.serviceUrl}/explain`, {
+        content: content
+      }, { timeout: 30000 });
+
+      return response.data.explanation;
+    } catch (error) {
+      console.error('LLM explanation error:', error);
+      return 'Error explaining code';
+    }
+  }
+
+  async suggestOptimizations(content) {
+    if (!this.isAvailable) return 'LLM service not available';
+
+    try {
+      const response = await axios.post(`${this.serviceUrl}/optimize`, {
+        content: content
+      }, { timeout: 30000 });
+
+      return response.data.suggestions;
+    } catch (error) {
+      console.error('LLM optimization error:', error);
+      return 'Error generating suggestions';
+    }
+  }
+
+  async getRelatedQueries(content) {
+    if (!this.isAvailable) return [];
+
+    try {
+      const response = await axios.post(`${this.serviceUrl}/related`, {
+        content: content
+      }, { timeout: 15000 });
+
+      return response.data.queries;
+    } catch (error) {
+      console.error('LLM related queries error:', error);
+      return [];
+    }
+  }
+
+  async semanticSearch(query, bookmarks) {
+    if (!this.isAvailable || bookmarks.length === 0) return bookmarks;
+
+    try {
+      const response = await axios.post(`${this.serviceUrl}/search`, {
+        query: query,
+        bookmarks: bookmarks
+      }, { timeout: 30000 });
+
+      return response.data.bookmarks;
+    } catch (error) {
+      console.error('Semantic search error:', error);
+      return bookmarks;
+    }
+  }
+
+  cleanup() {
+    if (this.pythonProcess) {
+      console.log('🔄 Shutting down Python LLM service...');
+      this.pythonProcess.kill('SIGTERM');
+      this.pythonProcess = null;
+    }
+  }
+
+  // Fallback methods when LLM is unavailable
+  fallbackAnalysis(content) {
+    return {
+      title: this.extractTitle(content),
+      tags: this.generateTags(content),
+      summary: this.generateSummary(content),
+      language: this.detectLanguage(content)
+    };
+  }
+
+  extractTitle(content) {
+    const lines = content.split('\n').filter(line => line.trim());
+    if (lines.length === 0) return 'Untitled';
+    const firstLine = lines[0].trim();
+    return firstLine.length > 50 ? firstLine.substring(0, 50) + '...' : firstLine;
+  }
+
+  generateTags(content) {
+    const tags = new Set();
+    const lowercased = content.toLowerCase();
+
+    const languageKeywords = {
+      'javascript': ['function', 'const', 'let', 'var', 'async', 'await'],
+      'python': ['def', 'class', 'import', 'from', 'lambda'],
+      'java': ['public', 'private', 'class', 'interface', 'static'],
+      'cpp': ['#include', 'namespace', 'class', 'struct'],
+      'sql': ['select', 'insert', 'update', 'delete', 'create']
+    };
+
+    for (const [lang, keywords] of Object.entries(languageKeywords)) {
+      if (keywords.some(keyword => lowercased.includes(keyword))) {
+        tags.add(lang);
+      }
+    }
+
+    return Array.from(tags);
+  }
+
+  generateSummary(content) {
+    const words = content.split(/\s+/);
+    return words.length > 20 ? words.slice(0, 20).join(' ') + '...' : content;
+  }
+
+  detectLanguage(content) {
+    const lowercased = content.toLowerCase();
+    if (lowercased.includes('def ') || lowercased.includes('import ')) return 'python';
+    if (lowercased.includes('function ') || lowercased.includes('const ')) return 'javascript';
+    if (lowercased.includes('public class')) return 'java';
+    if (lowercased.includes('#include')) return 'cpp';
+    if (lowercased.includes('select ')) return 'sql';
+    return 'text';
+  }
+}
 
 // Try to import clipboard monitoring libraries
 let clipboardy = null;
@@ -38,6 +270,7 @@ class CodeBookmarkApp {
     this.clipboardMonitorInterval = null;
     this.recentClipboardHistory = [];
     this.overlayTimeout = null;
+    this.llmService = new PythonLLMService();
   }
 
   async createWindow() {
@@ -918,36 +1151,101 @@ class CodeBookmarkApp {
     }
   }
 
+  // async createBookmark(content) {
+  //   console.log('createBookmark called with content length:', content.length);
+  //
+  //   // Check for duplicates if enabled
+  //   if (this.settings.deduplicate) {
+  //     console.log('Checking for duplicates...');
+  //     const duplicate = this.findSimilarBookmark(content);
+  //     if (duplicate) {
+  //       console.log('Duplicate found, skipping bookmark creation');
+  //       return null; // Skip duplicate
+  //     }
+  //   }
+  //
+  //   console.log('Creating new bookmark...');
+  //   const bookmark = {
+  //     id: Date.now().toString(),
+  //     content: content,
+  //     title: this.extractTitle(content),
+  //     tags: this.settings.autoTag ? this.generateTags(content) : [],
+  //     summary: this.generateSummary(content),
+  //     timestamp: new Date().toISOString(),
+  //     language: this.detectLanguage(content)
+  //   };
+  //
+  //   console.log('Bookmark created:', {
+  //     id: bookmark.id,
+  //     title: bookmark.title,
+  //     contentLength: bookmark.content.length,
+  //     tags: bookmark.tags,
+  //     language: bookmark.language
+  //   });
+  //
+  //   return bookmark;
+  // }
+
+  // Enhanced createBookmark with Python LLM analysis
   async createBookmark(content) {
-    console.log('createBookmark called with content length:', content.length);
+    console.log('createBookmark called with Python LLM analysis...');
 
     // Check for duplicates if enabled
     if (this.settings.deduplicate) {
-      console.log('Checking for duplicates...');
       const duplicate = this.findSimilarBookmark(content);
       if (duplicate) {
         console.log('Duplicate found, skipping bookmark creation');
-        return null; // Skip duplicate
+        return null;
       }
     }
 
-    console.log('Creating new bookmark...');
-    const bookmark = {
+    let bookmark = {
       id: Date.now().toString(),
       content: content,
-      title: this.extractTitle(content),
-      tags: this.settings.autoTag ? this.generateTags(content) : [],
-      summary: this.generateSummary(content),
-      timestamp: new Date().toISOString(),
-      language: this.detectLanguage(content)
+      timestamp: new Date().toISOString()
     };
 
-    console.log('Bookmark created:', {
+    // Try Python LLM analysis first
+    if (this.llmService.isAvailable) {
+      try {
+        console.log('🤖 Using Python LLM for analysis...');
+        const analysis = await this.llmService.analyzeCode(content);
+
+        if (analysis && analysis.title) {
+          bookmark.title = analysis.title;
+          bookmark.tags = analysis.tags || [];
+          bookmark.summary = analysis.summary || content.substring(0, 100) + '...';
+          bookmark.language = analysis.language || 'text';
+          bookmark.aiGenerated = true;
+          console.log('✅ Python LLM analysis successful');
+        } else {
+          throw new Error('Invalid LLM response');
+        }
+      } catch (error) {
+        console.log('❌ Python LLM analysis failed, using fallback:', error.message);
+        const fallback = this.llmService.fallbackAnalysis(content);
+        bookmark.title = fallback.title;
+        bookmark.tags = fallback.tags;
+        bookmark.summary = fallback.summary;
+        bookmark.language = fallback.language;
+        bookmark.aiGenerated = false;
+      }
+    } else {
+      // Fallback to existing methods
+      console.log('📋 Using fallback analysis methods');
+      const fallback = this.llmService.fallbackAnalysis(content);
+      bookmark.title = fallback.title;
+      bookmark.tags = fallback.tags;
+      bookmark.summary = fallback.summary;
+      bookmark.language = fallback.language;
+      bookmark.aiGenerated = false;
+    }
+
+    console.log('Bookmark created with Python LLM features:', {
       id: bookmark.id,
       title: bookmark.title,
-      contentLength: bookmark.content.length,
-      tags: bookmark.tags,
-      language: bookmark.language
+      language: bookmark.language,
+      aiGenerated: bookmark.aiGenerated
     });
 
     return bookmark;
@@ -1211,15 +1509,74 @@ class CodeBookmarkApp {
       this.hideOverlay();
     });
 
+    // Python LLM-powered features
+    ipcMain.handle('explain-code', async (event, content) => {
+      console.log('🤖 Explaining code with Python LLM...');
+      const explanation = await this.llmService.explainCode(content);
+      return explanation;
+    });
+
+    ipcMain.handle('suggest-optimizations', async (event, content) => {
+      console.log('⚡ Generating optimizations with Python LLM...');
+      const suggestions = await this.llmService.suggestOptimizations(content);
+      return suggestions;
+    });
+
+    ipcMain.handle('get-related-queries', async (event, content) => {
+      console.log('🔗 Getting related queries with Python LLM...');
+      const queries = await this.llmService.getRelatedQueries(content);
+      return queries;
+    });
+
+    ipcMain.handle('llm-status', () => {
+      return {
+        available: this.llmService.isAvailable,
+        type: 'python-service',
+        service: 'DeepSeek/Gemma via Python'
+      };
+    });
+
+    console.log('Python LLM IPC handlers set up successfully');
+
     console.log('IPC handlers set up successfully');
   }
 
-  searchBookmarks(query) {
+  // searchBookmarks(query) {
+  //   if (!query || query.trim() === '') {
+  //     // Return bookmarks sorted by newest first
+  //     return this.bookmarks.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  //   }
+  //
+  //   const Fuse = require('fuse.js');
+  //   const fuse = new Fuse(this.bookmarks, {
+  //     keys: ['title', 'content', 'tags', 'summary'],
+  //     threshold: 0.3,
+  //     includeScore: true
+  //   });
+  //
+  //   const results = fuse.search(query);
+  //   // Sort results by newest first
+  //   return results.map(result => result.item)
+  //   .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  // }
+  async searchBookmarks(query) {
     if (!query || query.trim() === '') {
-      // Return bookmarks sorted by newest first
       return this.bookmarks.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     }
 
+    // Try semantic search first
+    if (this.llmService.isAvailable) {
+      try {
+        console.log('🔍 Using semantic search...');
+        const semanticResults = await this.llmService.semanticSearch(query, this.bookmarks);
+        console.log('✅ Semantic search completed');
+        return semanticResults;
+      } catch (error) {
+        console.log('❌ Semantic search failed, falling back to regular search');
+      }
+    }
+
+    // Fallback to existing Fuse.js search
     const Fuse = require('fuse.js');
     const fuse = new Fuse(this.bookmarks, {
       keys: ['title', 'content', 'tags', 'summary'],
@@ -1228,11 +1585,28 @@ class CodeBookmarkApp {
     });
 
     const results = fuse.search(query);
-    // Sort results by newest first
     return results.map(result => result.item)
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+                 .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
   }
 
+  // cleanup() {
+  //   console.log('Cleaning up CodeBookmark app...');
+  //
+  //   this.stopClipboardMonitoring();
+  //
+  //   if (this.overlayTimeout) {
+  //     clearTimeout(this.overlayTimeout);
+  //     this.overlayTimeout = null;
+  //   }
+  //
+  //   if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
+  //     this.overlayWindow.destroy();
+  //     this.overlayWindow = null;
+  //     console.log('Overlay window destroyed');
+  //   }
+  //
+  //   console.log('Cleanup completed');
+  // }
   cleanup() {
     console.log('Cleaning up CodeBookmark app...');
 
@@ -1247,6 +1621,11 @@ class CodeBookmarkApp {
       this.overlayWindow.destroy();
       this.overlayWindow = null;
       console.log('Overlay window destroyed');
+    }
+
+    // Cleanup Python LLM service
+    if (this.llmService) {
+      this.llmService.cleanup();
     }
 
     console.log('Cleanup completed');
