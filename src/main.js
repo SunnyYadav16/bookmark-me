@@ -1214,21 +1214,6 @@ class CodeBookmarkApp {
     console.log('IPC handlers set up successfully');
   }
 
-  // searchBookmarks(query) {
-  //   if (!query || query.trim() === '') {
-  //     return this.bookmarks;
-  //   }
-  //
-  //   const Fuse = require('fuse.js');
-  //   const fuse = new Fuse(this.bookmarks, {
-  //     keys: ['title', 'content', 'tags', 'summary'],
-  //     threshold: 0.3,
-  //     includeScore: true
-  //   });
-  //
-  //   const results = fuse.search(query);
-  //   return results.map(result => result.item);
-  // }
   searchBookmarks(query) {
     if (!query || query.trim() === '') {
       // Return bookmarks sorted by newest first
