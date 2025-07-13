@@ -1,8 +1,16 @@
-const { app, BrowserWindow, Tray, Menu, globalShortcut, clipboard, ipcMain, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, globalShortcut, clipboard, ipcMain, nativeImage, screen } = require('electron');
 const path = require('path');
 const Store = require('electron-store');
 const natural = require('natural');
 const similarity = require('similarity');
+
+// Try to import clipboard monitoring libraries
+let clipboardy = null;
+try {
+  clipboardy = require('clipboardy');
+} catch (e) {
+  console.log('clipboardy not available, using fallback');
+}
 
 // Initialize persistent storage
 const store = new Store({
@@ -13,7 +21,8 @@ const store = new Store({
       shortcut: 'CommandOrControl+Shift+B',
       autoTag: true,
       deduplicate: true,
-      minSimilarity: 0.8
+      minSimilarity: 0.8,
+      clipboardMonitoring: true
     }
   }
 });
@@ -22,11 +31,18 @@ class CodeBookmarkApp {
   constructor() {
     this.mainWindow = null;
     this.tray = null;
+    this.overlayWindow = null;
     this.bookmarks = store.get('bookmarks', []);
     this.settings = store.get('settings', {});
+    this.lastClipboardContent = '';
+    this.clipboardMonitorInterval = null;
+    this.recentClipboardHistory = [];
+    this.overlayTimeout = null;
   }
 
   async createWindow() {
+    console.log('Creating main window...');
+
     this.mainWindow = new BrowserWindow({
       width: 1200,
       height: 800,
@@ -34,33 +50,639 @@ class CodeBookmarkApp {
         nodeIntegration: true,
         contextIsolation: false
       },
-      show: false,
+      show: false, // Keep window hidden by default
       icon: this.createIcon()
     });
 
-    await this.mainWindow.loadFile('src/renderer/index.html');
+    try {
+      const htmlPath = path.join(__dirname, 'renderer', 'index.html');
+      console.log('Loading HTML file from:', htmlPath);
+
+      await this.mainWindow.loadFile(htmlPath);
+      console.log('Main window created and loaded (hidden)');
+    } catch (error) {
+      console.error('Error loading main window:', error);
+
+      // Try alternative path
+      try {
+        await this.mainWindow.loadFile('src/renderer/index.html');
+        console.log('Main window loaded with alternative path (hidden)');
+      } catch (altError) {
+        console.error('Alternative path also failed:', altError);
+      }
+    }
 
     // Hide window instead of closing
     this.mainWindow.on('close', (event) => {
       if (!app.isQuiting) {
         event.preventDefault();
         this.mainWindow.hide();
+
+        // Hide dock icon when window is hidden (back to background mode)
+        if (process.platform === 'darwin') {
+          app.dock.hide();
+        }
+
+        console.log('Main window hidden');
       }
+    });
+
+    // Add window state logging
+    this.mainWindow.on('show', () => {
+      console.log('Main window shown');
+    });
+
+    this.mainWindow.on('hide', () => {
+      console.log('Main window hidden');
+
+      // Hide dock icon when window is hidden (back to background mode)
+      if (process.platform === 'darwin') {
+        app.dock.hide();
+      }
+    });
+
+    // Add error logging
+    this.mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+      console.error('Window failed to load:', errorCode, errorDescription);
     });
   }
 
+  createOverlayWindow() {
+    console.log('Creating overlay window...');
+
+    this.overlayWindow = new BrowserWindow({
+      width: 180,
+      height: 60,
+      frame: false,
+      transparent: true,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      closable: false,
+      show: false,
+      webPreferences: {
+        nodeIntegration: true,
+        contextIsolation: false
+      }
+    });
+
+    // Create overlay HTML content
+    const overlayHTML = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <style>
+          body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: transparent;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-app-region: no-drag;
+          }
+          
+          .overlay-container {
+            background: rgba(74, 144, 226, 0.95);
+            border-radius: 8px;
+            padding: 8px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            animation: slideIn 0.2s ease-out;
+          }
+          
+          @keyframes slideIn {
+            from {
+              opacity: 0;
+              transform: translateY(-10px);
+            }
+            to {
+              opacity: 1;
+              transform: translateY(0);
+            }
+          }
+          
+          .bookmark-icon {
+            font-size: 16px;
+            color: white;
+          }
+          
+          .bookmark-text {
+            color: white;
+            font-size: 12px;
+            font-weight: 500;
+            margin: 0;
+          }
+          
+          .overlay-container:hover {
+            background: rgba(74, 144, 226, 1);
+            transform: scale(1.05);
+            transition: all 0.2s ease;
+            cursor: pointer;
+          }
+          
+          .close-btn {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+            padding: 0;
+            margin-left: 4px;
+            opacity: 0.7;
+          }
+          
+          .close-btn:hover {
+            opacity: 1;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="overlay-container" onclick="bookmarkSelected()">
+          <span class="bookmark-icon">📚</span>
+          <span class="bookmark-text">Bookmark</span>
+          <button class="close-btn" onclick="event.stopPropagation(); closeOverlay()">×</button>
+        </div>
+        
+        <script>
+          const { ipcRenderer } = require('electron');
+          
+          function bookmarkSelected() {
+            console.log('Bookmark button clicked');
+            ipcRenderer.send('bookmark-from-overlay');
+          }
+          
+          function closeOverlay() {
+            console.log('Close button clicked');
+            ipcRenderer.send('hide-overlay');
+          }
+          
+          // Auto-hide after 4 seconds
+          setTimeout(() => {
+            ipcRenderer.send('hide-overlay');
+          }, 4000);
+        </script>
+      </body>
+      </html>
+    `;
+
+    this.overlayWindow.loadURL('data:text/html;charset=UTF-8,' + encodeURIComponent(overlayHTML));
+
+    this.overlayWindow.on('blur', () => {
+      // Hide overlay when it loses focus
+      this.hideOverlay();
+    });
+
+    console.log('Overlay window created');
+  }
+
+  showOverlay() {
+    if (!this.overlayWindow) {
+      this.createOverlayWindow();
+    }
+
+    // Get cursor position
+    const cursor = screen.getCursorScreenPoint();
+
+    // Position overlay near cursor, but avoid screen edges
+    const display = screen.getDisplayNearestPoint(cursor);
+    let x = cursor.x + 10;
+    let y = cursor.y - 70;
+
+    // Keep overlay within screen bounds
+    if (x + 180 > display.bounds.x + display.bounds.width) {
+      x = cursor.x - 190;
+    }
+    if (y < display.bounds.y) {
+      y = cursor.y + 20;
+    }
+
+    this.overlayWindow.setPosition(x, y);
+    this.overlayWindow.show();
+    this.overlayWindow.focus();
+
+    console.log('Overlay shown at position:', x, y);
+
+    // Clear any existing timeout
+    if (this.overlayTimeout) {
+      clearTimeout(this.overlayTimeout);
+    }
+
+    // Auto-hide after 5 seconds
+    this.overlayTimeout = setTimeout(() => {
+      this.hideOverlay();
+    }, 5000);
+  }
+
+  hideOverlay() {
+    if (this.overlayWindow && this.overlayWindow.isVisible()) {
+      this.overlayWindow.hide();
+      console.log('Overlay hidden');
+    }
+
+    if (this.overlayTimeout) {
+      clearTimeout(this.overlayTimeout);
+      this.overlayTimeout = null;
+    }
+  }
+
   createTray() {
-    const trayIcon = this.createIcon();
-    this.tray = new Tray(trayIcon);
+    try {
+      console.log('Creating tray icon...');
+
+      if (process.platform === 'darwin') {
+        // Option 1: Try creating icon first
+        try {
+          const trayIcon = this.createIcon();
+          this.tray = new Tray(trayIcon);
+        } catch (iconError) {
+          console.log('Icon creation failed, using text fallback');
+          // Option 2: Use empty icon and set title (text in menu bar)
+          this.tray = new Tray(nativeImage.createEmpty());
+          this.tray.setTitle('CB'); // This will show "CB" in the menu bar
+        }
+      } else {
+        // Windows/Linux
+        const trayIcon = this.createIcon();
+        this.tray = new Tray(trayIcon);
+      }
+
+      // Set tooltip
+      this.tray.setToolTip('CodeBookmark - Click to open');
+
+      // Initial tray menu
+      this.updateTrayMenu();
+
+      // Click handlers
+      this.tray.on('click', (event) => {
+        console.log('Tray clicked');
+
+        // On macOS with right button, show menu
+        if (process.platform === 'darwin' && event.altKey) {
+          this.tray.popUpContextMenu();
+        } else {
+          this.showAppWithDebug();
+        }
+      });
+
+      this.tray.on('right-click', () => {
+        console.log('Tray right-clicked - showing menu');
+        this.tray.popUpContextMenu();
+      });
+
+      console.log('System tray created successfully');
+
+      // Verify tray is working
+      setTimeout(() => {
+        if (this.tray && !this.tray.isDestroyed()) {
+          const bounds = this.tray.getBounds();
+          console.log('Tray bounds:', bounds);
+
+          // Show success notification
+          this.showNotification('CodeBookmark is running! Look for the icon in your menu bar.');
+        }
+      }, 1000);
+
+    } catch (error) {
+      console.error('Error creating system tray:', error);
+      console.error('Stack trace:', error.stack);
+
+      // Don't show error dialog, just use fallback
+      console.log('Tray creation failed, app will run without tray icon');
+
+      // Ensure the app still works without tray
+      this.showNotification('App is running! Use Cmd+Shift+B to bookmark.');
+
+      // Show the window so user can access the app
+      setTimeout(() => {
+        this.showAppWithDebug();
+      }, 1000);
+    }
+  }
+
+  async createIconFile() {
+    const fs = require('fs').promises;
+    const path = require('path');
+
+    try {
+      // Create a simple 16x16 PNG file
+      const size = 16;
+      const PNG = require('pngjs').PNG;
+      const png = new PNG({ width: size, height: size });
+
+      // Draw a simple black "B" on transparent background
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const idx = (size * y + x) << 2;
+
+          // Default: transparent
+          png.data[idx] = 0;
+          png.data[idx + 1] = 0;
+          png.data[idx + 2] = 0;
+          png.data[idx + 3] = 0;
+
+          // Draw "B" pattern
+          if ((x === 4 && y >= 3 && y <= 12) || // Vertical line
+              (y === 3 && x >= 4 && x <= 10) ||  // Top line
+              (y === 7 && x >= 4 && x <= 9) ||   // Middle line
+              (y === 12 && x >= 4 && x <= 10)) { // Bottom line
+            png.data[idx] = 0;     // R
+            png.data[idx + 1] = 0; // G
+            png.data[idx + 2] = 0; // B
+            png.data[idx + 3] = 255; // A
+          }
+        }
+      }
+
+      const buffer = PNG.sync.write(png);
+      const iconPath = path.join(__dirname, 'tray-icon.png');
+      await fs.writeFile(iconPath, buffer);
+
+      console.log('Created icon file at:', iconPath);
+      return iconPath;
+    } catch (error) {
+      console.error('Failed to create icon file:', error);
+      return null;
+    }
+  }
+
+  createIcon() {
+    try {
+      const size = 16;
+      const scaleFactor = 1;
+
+      // Create buffer for a 16x16 RGBA image
+      const buffer = Buffer.alloc(size * size * 4);
+
+      // Fill with transparent background
+      buffer.fill(0);
+
+      // Modern bookmark icon design
+      // Create a sleek bookmark shape with better proportions
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const idx = (y * size + x) * 4;
+
+          // Bookmark outline (modern rectangular bookmark with notch at bottom)
+          const isInBookmark = (
+              // Main rectangle body
+              (x >= 4 && x <= 11 && y >= 2 && y <= 13) ||
+              // Bottom notch (V-shape)
+              (x === 5 && y === 14) ||
+              (x === 6 && y === 15) ||
+              (x === 7 && y === 15) ||
+              (x === 8 && y === 15) ||
+              (x === 9 && y === 15) ||
+              (x === 10 && y === 14)
+          );
+
+          // Inner area (slightly smaller for hollow effect)
+          const isInner = (
+              x >= 5 && x <= 10 && y >= 3 && y <= 12
+          );
+
+          if (isInBookmark && !isInner) {
+            // Solid bookmark outline
+            buffer[idx] = 0;       // R
+            buffer[idx + 1] = 0;   // G
+            buffer[idx + 2] = 0;   // B
+            buffer[idx + 3] = 255; // A (opaque)
+          } else if (isInner) {
+            // Slightly transparent inner area for depth
+            buffer[idx] = 0;       // R
+            buffer[idx + 1] = 0;   // G
+            buffer[idx + 2] = 0;   // B
+            buffer[idx + 3] = 80;  // A (semi-transparent)
+          }
+
+          // Add small accent dots for visual interest
+          if ((x === 6 && y === 5) || (x === 9 && y === 5) ||
+              (x === 6 && y === 7) || (x === 9 && y === 7) ||
+              (x === 6 && y === 9) || (x === 9 && y === 9)) {
+            buffer[idx] = 0;       // R
+            buffer[idx + 1] = 0;   // G
+            buffer[idx + 2] = 0;   // B
+            buffer[idx + 3] = 255; // A (opaque)
+          }
+        }
+      }
+
+      // Create the native image
+      const icon = nativeImage.createFromBuffer(buffer, {
+        width: size,
+        height: size,
+        scaleFactor
+      });
+
+      // IMPORTANT: Set as template image for macOS
+      if (process.platform === 'darwin') {
+        icon.setTemplateImage(true);
+      }
+
+      // Verify icon is not empty
+      if (icon.isEmpty()) {
+        throw new Error('Created icon is empty');
+      }
+
+      console.log('Better bookmark icon created successfully, size:', icon.getSize());
+      return icon;
+
+    } catch (error) {
+      console.error('Error in createIcon:', error);
+      return this.createFallbackIcon();
+    }
+  }
+
+// Add this new method right after createIcon():
+  createFallbackIcon() {
+    try {
+      // Fallback: Create a simple but clean dot icon
+      const size = 16;
+      const buffer = Buffer.alloc(size * size * 4);
+
+      // Create a clean circular dot in the center
+      const centerX = 8;
+      const centerY = 8;
+      const radius = 3;
+
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const distance = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
+          if (distance <= radius) {
+            const idx = (y * size + x) * 4;
+            buffer[idx] = 0;       // R
+            buffer[idx + 1] = 0;   // G
+            buffer[idx + 2] = 0;   // B
+            buffer[idx + 3] = 255; // A
+          }
+        }
+      }
+
+      const fallbackIcon = nativeImage.createFromBuffer(buffer, {
+        width: size,
+        height: size
+      });
+
+      if (process.platform === 'darwin') {
+        fallbackIcon.setTemplateImage(true);
+      }
+
+      console.log('Fallback icon created successfully');
+      return fallbackIcon;
+    } catch (error) {
+      console.error('Even fallback icon failed:', error);
+      // Ultimate fallback - return empty icon
+      return nativeImage.createEmpty();
+    }
+  }
+
+  createTextIcon() {
+    // For macOS, you can actually just use text in the menu bar
+    if (process.platform === 'darwin') {
+      return null; // Return null to use text instead
+    }
+
+    // For other platforms, use the regular icon
+    return this.createIcon();
+  }
+
+  // Add this method to help debug and ensure the app shows:
+  showAppWithDebug() {
+    console.log('showAppWithDebug called');
+
+    // Force create window if it doesn't exist
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      console.log('Window does not exist or is destroyed, creating new window...');
+      this.createWindow().then(() => {
+        setTimeout(() => {
+          if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+            this.mainWindow.show();
+            this.mainWindow.focus();
+
+            // Show dock icon on macOS
+            if (process.platform === 'darwin') {
+              app.dock.show();
+            }
+
+            console.log('Window should now be visible');
+          }
+        }, 100);
+      });
+    } else {
+      console.log('Window exists, showing it...');
+
+      if (this.mainWindow.isMinimized()) {
+        this.mainWindow.restore();
+      }
+
+      this.mainWindow.show();
+      this.mainWindow.focus();
+
+      // Bring window to front
+      this.mainWindow.setAlwaysOnTop(true);
+      setTimeout(() => {
+        this.mainWindow.setAlwaysOnTop(false);
+      }, 100);
+
+      // Show dock icon on macOS
+      if (process.platform === 'darwin') {
+        app.dock.show();
+      }
+    }
+  }
+
+  setupClipboardMonitoring() {
+    console.log('Setting up clipboard monitoring...');
+
+    // Initialize with current clipboard content
+    this.lastClipboardContent = clipboard.readText() || '';
+
+    // Monitor clipboard changes every 300ms for better responsiveness
+    this.clipboardMonitorInterval = setInterval(() => {
+      try {
+        const currentContent = clipboard.readText() || '';
+
+        // Check if clipboard content changed
+        if (currentContent !== this.lastClipboardContent && currentContent.trim().length > 0) {
+          console.log('Clipboard changed, new content length:', currentContent.length);
+
+          // Only show overlay for meaningful content (not single characters or very short text)
+          if (currentContent.trim().length >= 5) {
+            console.log('Showing overlay for new clipboard content');
+            this.showOverlay();
+          }
+
+          // Add to recent history (keep last 10 items)
+          this.recentClipboardHistory.unshift({
+            content: currentContent,
+            timestamp: Date.now(),
+            bookmarked: false
+          });
+
+          // Keep only last 10 items
+          if (this.recentClipboardHistory.length > 10) {
+            this.recentClipboardHistory = this.recentClipboardHistory.slice(0, 10);
+          }
+
+          this.lastClipboardContent = currentContent;
+
+          // Update tray menu with recent clipboard items
+          this.updateTrayMenu();
+        }
+      } catch (error) {
+        console.error('Error monitoring clipboard:', error);
+      }
+    }, 300);
+
+    console.log('Clipboard monitoring started');
+  }
+
+  stopClipboardMonitoring() {
+    if (this.clipboardMonitorInterval) {
+      clearInterval(this.clipboardMonitorInterval);
+      this.clipboardMonitorInterval = null;
+      console.log('Clipboard monitoring stopped');
+    }
+  }
+
+  updateTrayMenu() {
+    if (!this.tray) return;
+
+    const recentItems = this.recentClipboardHistory.slice(0, 5).map((item, index) => {
+      const preview = item.content.substring(0, 50) + (item.content.length > 50 ? '...' : '');
+      const isBookmarked = item.bookmarked ? ' ✓' : '';
+
+      return {
+        label: `${index + 1}. ${preview}${isBookmarked}`,
+        click: () => this.bookmarkClipboardItem(item)
+      };
+    });
 
     const contextMenu = Menu.buildFromTemplate([
       {
-        label: 'Quick Bookmark',
+        label: 'Recent Clipboard Items',
+        enabled: false
+      },
+      { type: 'separator' },
+      ...recentItems,
+      { type: 'separator' },
+      {
+        label: 'Bookmark Current Clipboard',
         click: () => this.quickBookmark()
       },
       {
         label: 'Show CodeBookmark',
-        click: () => this.showWindow()
+        click: () => {
+          console.log('Show CodeBookmark clicked');
+          this.showWindow();
+        }
       },
       { type: 'separator' },
       {
@@ -76,27 +698,41 @@ class CodeBookmarkApp {
       }
     ]);
 
-    this.tray.setToolTip('CodeBookmark - Your Personal Code Library');
     this.tray.setContextMenu(contextMenu);
-
-    this.tray.on('double-click', () => {
-      this.showWindow();
-    });
   }
 
-  createIcon() {
-    // Create a simple icon programmatically
-    const canvas = require('canvas');
-    const canvasElement = canvas.createCanvas(16, 16);
-    const ctx = canvasElement.getContext('2d');
+  async bookmarkClipboardItem(clipboardItem) {
+    console.log('Bookmarking clipboard item:', clipboardItem.content.substring(0, 50) + '...');
 
-    ctx.fillStyle = '#4A90E2';
-    ctx.fillRect(0, 0, 16, 16);
-    ctx.fillStyle = '#FFFFFF';
-    ctx.font = '12px Arial';
-    ctx.fillText('B', 4, 12);
+    try {
+      const bookmark = await this.createBookmark(clipboardItem.content);
 
-    return nativeImage.createFromDataURL(canvasElement.toDataURL());
+      if (bookmark) {
+        // Add to beginning of array for latest first
+        this.bookmarks.unshift(bookmark);
+        this.saveBookmarks();
+
+        // Mark as bookmarked
+        clipboardItem.bookmarked = true;
+        this.updateTrayMenu();
+
+        // Show success notification
+        this.showNotification(`✓ Bookmarked: ${bookmark.title}`);
+
+        // Notify renderer process if window is open
+        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          this.mainWindow.webContents.send('bookmark-added', bookmark);
+        }
+
+        console.log('Clipboard item bookmarked successfully');
+      } else {
+        console.log('Bookmark not created (possibly duplicate)');
+        this.showNotification('⚠ Bookmark already exists (duplicate detected)');
+      }
+    } catch (error) {
+      console.error('Error bookmarking clipboard item:', error);
+      this.showNotification('❌ Error creating bookmark');
+    }
   }
 
   setupGlobalShortcuts() {
@@ -104,33 +740,198 @@ class CodeBookmarkApp {
     globalShortcut.register(this.settings.shortcut, () => {
       this.quickBookmark();
     });
+
+    console.log('Global shortcuts registered');
   }
 
   async quickBookmark() {
-    const clipboardText = clipboard.readText();
+    console.log('Quick bookmark triggered');
 
-    if (!clipboardText || clipboardText.trim().length === 0) {
+    // Store the current clipboard content to restore later
+    const previousClipboard = clipboard.readText() || '';
+
+    // Try to copy selected text automatically
+    try {
+      if (process.platform === 'darwin') {
+        // On macOS, use AppleScript to simulate Cmd+C
+        const { exec } = require('child_process');
+        await new Promise((resolve, reject) => {
+          exec(`osascript -e 'tell application "System Events" to keystroke "c" using command down'`, (error) => {
+            if (error) {
+              console.error('Error with AppleScript:', error);
+              reject(error);
+            } else {
+              resolve();
+            }
+          });
+        });
+      } else if (process.platform === 'win32') {
+        // On Windows, use PowerShell or native commands
+        const { exec } = require('child_process');
+        await new Promise((resolve, reject) => {
+          exec('powershell -command "[System.Windows.Forms.SendKeys]::SendWait(\'^c\')"', (error) => {
+            if (error) {
+              console.error('Error with PowerShell:', error);
+              reject(error);
+            } else {
+              resolve();
+            }
+          });
+        });
+      } else {
+        // On Linux, use xdotool if available
+        const { exec } = require('child_process');
+        await new Promise((resolve, reject) => {
+          exec('xdotool key ctrl+c', (error) => {
+            if (error) {
+              console.error('Error with xdotool:', error);
+              reject(error);
+            } else {
+              resolve();
+            }
+          });
+        });
+      }
+
+      // Longer delay to ensure clipboard is updated
+      await new Promise(resolve => setTimeout(resolve, 200));
+    } catch (error) {
+      console.error('Error simulating copy:', error);
+      // If auto-copy fails, check if user has already copied something
+      const currentClipboard = clipboard.readText() || '';
+      if (currentClipboard !== previousClipboard && currentClipboard.trim().length >= 3) {
+        console.log('Using existing clipboard content instead');
+        // Continue with existing clipboard content
+      } else {
+        // Show helpful error message
+        this.showNotification('Auto-copy failed. Please copy text manually (Cmd+C) then press Cmd+Shift+B');
+        return;
+      }
+    }
+
+    // Get the newly copied content (selected text)
+    const selectedContent = clipboard.readText() || '';
+    console.log('Selected content length:', selectedContent.length);
+
+    // Check if new content was copied (different from previous)
+    if (selectedContent === previousClipboard || !selectedContent || selectedContent.trim().length === 0) {
+      console.log('No text selected or copy failed');
+      this.showNotification('Select text and try again, or copy manually with Cmd+C first');
       return;
     }
 
-    const bookmark = await this.createBookmark(clipboardText);
+    // Check if content is too short
+    if (selectedContent.trim().length < 3) {
+      console.log('Selected text too short');
+      this.showNotification('Selected text is too short to bookmark');
+      return;
+    }
 
-    if (bookmark) {
-      this.bookmarks.push(bookmark);
-      this.saveBookmarks();
-      this.notifyBookmarkSaved(bookmark);
+    try {
+      console.log('Creating bookmark for selected text...');
+      const bookmark = await this.createBookmark(selectedContent);
+
+      if (bookmark) {
+        console.log('Bookmark created successfully:', bookmark.title);
+        // Add to beginning of array for latest first
+        this.bookmarks.unshift(bookmark);
+        this.saveBookmarks();
+
+        // Add to recent clipboard history
+        this.recentClipboardHistory.unshift({
+          content: selectedContent,
+          timestamp: Date.now(),
+          bookmarked: true
+        });
+
+        // Keep only last 10 items
+        if (this.recentClipboardHistory.length > 10) {
+          this.recentClipboardHistory = this.recentClipboardHistory.slice(0, 10);
+        }
+
+        // Update the last clipboard content
+        this.lastClipboardContent = selectedContent;
+        this.updateTrayMenu();
+
+        // Show success notification
+        this.showNotification(`✓ Bookmarked selected text: ${bookmark.title}`);
+
+        // Notify renderer process if window is open
+        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          this.mainWindow.webContents.send('bookmark-added', bookmark);
+        }
+
+        console.log('Bookmark process completed successfully');
+      } else {
+        console.log('Bookmark was not created (possibly duplicate)');
+        this.showNotification('⚠ Selected text already bookmarked');
+      }
+
+    } catch (error) {
+      console.error('Error during quick bookmark:', error);
+      this.showNotification('❌ Error creating bookmark');
+    }
+  }
+
+  async bookmarkCurrentClipboard() {
+    const currentContent = clipboard.readText() || '';
+    console.log('Bookmarking current clipboard content, length:', currentContent.length);
+
+    if (!currentContent || currentContent.trim().length < 3) {
+      console.log('Clipboard content too short or empty');
+      this.showNotification('No valid content to bookmark');
+      return;
+    }
+
+    try {
+      const bookmark = await this.createBookmark(currentContent);
+
+      if (bookmark) {
+        console.log('Bookmark created successfully:', bookmark.title);
+        // Add to beginning of array for latest first
+        this.bookmarks.unshift(bookmark);
+        this.saveBookmarks();
+
+        // Mark recent clipboard item as bookmarked
+        const recentItem = this.recentClipboardHistory.find(item => item.content === currentContent);
+        if (recentItem) {
+          recentItem.bookmarked = true;
+          this.updateTrayMenu();
+        }
+
+        // Show success notification
+        this.showNotification(`✓ Bookmarked: ${bookmark.title}`);
+
+        // Notify renderer process if window is open
+        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          this.mainWindow.webContents.send('bookmark-added', bookmark);
+        }
+
+        console.log('Bookmark process completed successfully');
+      } else {
+        console.log('Bookmark not created (possibly duplicate)');
+        this.showNotification('⚠ Bookmark already exists');
+      }
+    } catch (error) {
+      console.error('Error bookmarking clipboard content:', error);
+      this.showNotification('❌ Error creating bookmark');
     }
   }
 
   async createBookmark(content) {
+    console.log('createBookmark called with content length:', content.length);
+
     // Check for duplicates if enabled
     if (this.settings.deduplicate) {
+      console.log('Checking for duplicates...');
       const duplicate = this.findSimilarBookmark(content);
       if (duplicate) {
+        console.log('Duplicate found, skipping bookmark creation');
         return null; // Skip duplicate
       }
     }
 
+    console.log('Creating new bookmark...');
     const bookmark = {
       id: Date.now().toString(),
       content: content,
@@ -140,6 +941,14 @@ class CodeBookmarkApp {
       timestamp: new Date().toISOString(),
       language: this.detectLanguage(content)
     };
+
+    console.log('Bookmark created:', {
+      id: bookmark.id,
+      title: bookmark.title,
+      contentLength: bookmark.content.length,
+      tags: bookmark.tags,
+      language: bookmark.language
+    });
 
     return bookmark;
   }
@@ -255,18 +1064,89 @@ class CodeBookmarkApp {
   }
 
   saveBookmarks() {
+    console.log('Saving bookmarks to store, total count:', this.bookmarks.length);
+    // Sort bookmarks by timestamp (newest first) before saving
+    this.bookmarks.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     store.set('bookmarks', this.bookmarks);
+    console.log('Bookmarks saved successfully');
   }
 
-  notifyBookmarkSaved(bookmark) {
-    // Simple notification - in production, you'd use electron notifications
-    console.log(`Bookmark saved: ${bookmark.title}`);
+  showNotification(message) {
+    console.log('Showing notification:', message);
+
+    // Use Electron's built-in notification system (system notifications)
+    const { Notification } = require('electron');
+
+    if (Notification.isSupported()) {
+      try {
+        const notification = new Notification({
+          title: 'CodeBookmark',
+          body: message,
+          icon: this.createIcon(),
+          silent: false
+        });
+
+        notification.show();
+        console.log('System notification shown');
+
+        // Auto-close after 4 seconds
+        setTimeout(() => {
+          notification.close();
+        }, 4000);
+      } catch (error) {
+        console.error('Error showing notification:', error);
+        console.log('Fallback notification:', message);
+      }
+    } else {
+      // Fallback for systems that don't support notifications
+      console.log(`Notification: ${message}`);
+    }
   }
 
   showWindow() {
+    console.log('showWindow called - explicit user action');
+
     if (this.mainWindow) {
+      console.log('Main window exists, showing...');
+
+      if (this.mainWindow.isDestroyed()) {
+        console.log('Main window was destroyed, creating new one...');
+        this.createWindow().then(() => {
+          this.mainWindow.show();
+          this.mainWindow.focus();
+
+          // Show dock icon when user explicitly opens window
+          if (process.platform === 'darwin') {
+            app.dock.show();
+          }
+        });
+        return;
+      }
+
+      if (this.mainWindow.isMinimized()) {
+        this.mainWindow.restore();
+      }
+
       this.mainWindow.show();
       this.mainWindow.focus();
+
+      // Show dock icon when user explicitly opens window
+      if (process.platform === 'darwin') {
+        app.dock.show();
+      }
+
+      console.log('Main window should now be visible');
+    } else {
+      console.log('Main window does not exist, creating new one...');
+      this.createWindow().then(() => {
+        this.mainWindow.show();
+        this.mainWindow.focus();
+
+        // Show dock icon when user explicitly opens window
+        if (process.platform === 'darwin') {
+          app.dock.show();
+        }
+      });
     }
   }
 
@@ -276,25 +1156,28 @@ class CodeBookmarkApp {
   }
 
   setupIPC() {
-    // Get all bookmarks
+    console.log('Setting up IPC handlers...');
+
+    // Existing IPC handlers
     ipcMain.handle('get-bookmarks', () => {
+      console.log('get-bookmarks called, returning', this.bookmarks.length, 'bookmarks');
       return this.bookmarks;
     });
 
-    // Search bookmarks
     ipcMain.handle('search-bookmarks', (event, query) => {
+      console.log('search-bookmarks called with query:', query);
       return this.searchBookmarks(query);
     });
 
-    // Delete bookmark
     ipcMain.handle('delete-bookmark', (event, id) => {
+      console.log('delete-bookmark called with id:', id);
       this.bookmarks = this.bookmarks.filter(b => b.id !== id);
       this.saveBookmarks();
       return true;
     });
 
-    // Update bookmark
     ipcMain.handle('update-bookmark', (event, bookmark) => {
+      console.log('update-bookmark called');
       const index = this.bookmarks.findIndex(b => b.id === bookmark.id);
       if (index !== -1) {
         this.bookmarks[index] = bookmark;
@@ -304,21 +1187,52 @@ class CodeBookmarkApp {
       return false;
     });
 
-    // Add bookmark manually
     ipcMain.handle('add-bookmark', async (event, content) => {
+      console.log('add-bookmark called');
       const bookmark = await this.createBookmark(content);
       if (bookmark) {
-        this.bookmarks.push(bookmark);
+        // Add to beginning of array for latest first
+        this.bookmarks.unshift(bookmark);
         this.saveBookmarks();
         return bookmark;
       }
       return null;
     });
+
+    // New overlay IPC handlers
+    ipcMain.on('bookmark-from-overlay', async (event) => {
+      console.log('Bookmark from overlay requested');
+      this.hideOverlay();
+      await this.bookmarkCurrentClipboard();
+    });
+
+    ipcMain.on('hide-overlay', (event) => {
+      console.log('Hide overlay requested');
+      this.hideOverlay();
+    });
+
+    console.log('IPC handlers set up successfully');
   }
 
+  // searchBookmarks(query) {
+  //   if (!query || query.trim() === '') {
+  //     return this.bookmarks;
+  //   }
+  //
+  //   const Fuse = require('fuse.js');
+  //   const fuse = new Fuse(this.bookmarks, {
+  //     keys: ['title', 'content', 'tags', 'summary'],
+  //     threshold: 0.3,
+  //     includeScore: true
+  //   });
+  //
+  //   const results = fuse.search(query);
+  //   return results.map(result => result.item);
+  // }
   searchBookmarks(query) {
     if (!query || query.trim() === '') {
-      return this.bookmarks;
+      // Return bookmarks sorted by newest first
+      return this.bookmarks.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     }
 
     const Fuse = require('fuse.js');
@@ -329,33 +1243,122 @@ class CodeBookmarkApp {
     });
 
     const results = fuse.search(query);
-    return results.map(result => result.item);
+    // Sort results by newest first
+    return results.map(result => result.item)
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  }
+
+  cleanup() {
+    console.log('Cleaning up CodeBookmark app...');
+
+    this.stopClipboardMonitoring();
+
+    if (this.overlayTimeout) {
+      clearTimeout(this.overlayTimeout);
+      this.overlayTimeout = null;
+    }
+
+    if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
+      this.overlayWindow.destroy();
+      this.overlayWindow = null;
+      console.log('Overlay window destroyed');
+    }
+
+    console.log('Cleanup completed');
   }
 
   async initialize() {
-    await this.createWindow();
-    this.createTray();
-    this.setupGlobalShortcuts();
+    console.log('Initializing CodeBookmark app...');
+
+    // Set up IPC handlers first
     this.setupIPC();
+
+    try {
+      await this.createWindow();
+      this.createOverlayWindow();
+      this.createTray();
+      this.setupGlobalShortcuts();
+
+      // Start clipboard monitoring
+      this.setupClipboardMonitoring();
+
+      console.log('CodeBookmark app initialized successfully');
+
+      // Show a welcome notification
+      setTimeout(() => {
+        this.showNotification('CodeBookmark is ready! Copy some text to see the magic ✨');
+      }, 1000);
+
+      // On first launch, show the window briefly so users know the app is running
+      const isFirstLaunch = store.get('firstLaunch', true);
+      if (isFirstLaunch) {
+        console.log('First launch detected, showing window...');
+        setTimeout(() => {
+          this.showAppWithDebug();
+          store.set('firstLaunch', false);
+
+          // Hide after 5 seconds on first launch
+          setTimeout(() => {
+            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+              this.mainWindow.hide();
+
+              // Hide dock icon on macOS after showing the app
+              if (process.platform === 'darwin') {
+                app.dock.hide();
+              }
+
+              this.showNotification('CodeBookmark is now running in the background. Look for the icon in your system tray!');
+            }
+          }, 5000);
+        }, 500);
+      } else {
+        // Not first launch - hide dock icon on macOS
+        if (process.platform === 'darwin') {
+          app.dock.hide();
+          console.log('Dock icon hidden on macOS');
+        }
+      }
+
+    } catch (error) {
+      console.error('Error during initialization:', error);
+
+      // Show error dialog
+      const { dialog } = require('electron');
+      dialog.showErrorBox('Initialization Error', `Failed to initialize app: ${error.message}`);
+    }
   }
 }
 
+// Global app instance
+let codeBookmarkApp = null;
+
 // App event handlers
 app.whenReady().then(async () => {
-  const codeBookmark = new CodeBookmarkApp();
-  await codeBookmark.initialize();
+  codeBookmarkApp = new CodeBookmarkApp();
+  await codeBookmarkApp.initialize();
 });
 
 app.on('window-all-closed', () => {
-  // Keep app running in background
+  // Keep app running in background - don't quit
+  console.log('All windows closed, keeping app running in background');
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
+  // On macOS, only show window if user explicitly clicks dock icon
+  // Don't auto-show window just because app is activated
+  console.log('App activated');
+  if (BrowserWindow.getAllWindows().length === 0 && codeBookmarkApp) {
+    // Only create window if none exist, but don't show it
+    codeBookmarkApp.createWindow();
   }
 });
 
 app.on('will-quit', () => {
+  console.log('App will quit, cleaning up...');
   globalShortcut.unregisterAll();
+
+  // Clean up app resources
+  if (codeBookmarkApp) {
+    codeBookmarkApp.cleanup();
+  }
 });

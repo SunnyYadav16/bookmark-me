@@ -37,6 +37,7 @@
       flex: 1;
       padding: 20px;
       overflow-y: auto;
+      scroll-behavior: smooth;
     }
 
     .header {
@@ -76,6 +77,20 @@
       top: 50%;
       transform: translateY(-50%);
       color: #888;
+    }
+
+    .sort-container {
+      margin-bottom: 15px;
+    }
+
+    .sort-select {
+      width: 100%;
+      padding: 8px 12px;
+      border: 1px solid #e0e0e0;
+      border-radius: 6px;
+      font-size: 13px;
+      background: white;
+      cursor: pointer;
     }
 
     .add-bookmark-btn {
@@ -125,13 +140,47 @@
       padding: 20px;
       margin-bottom: 15px;
       box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-      transition: transform 0.2s, box-shadow 0.2s;
+      transition: transform 0.2s, box-shadow 0.2s, opacity 0.3s;
       cursor: pointer;
+      position: relative;
+      opacity: 0;
+      animation: fadeIn 0.5s ease-in-out forwards;
     }
 
     .bookmark-item:hover {
       transform: translateY(-2px);
       box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+    }
+
+    .bookmark-item.newest {
+      border-left: 4px solid #4A90E2;
+      background: linear-gradient(90deg, rgba(74, 144, 226, 0.05) 0%, white 100%);
+    }
+
+    .bookmark-item.new-badge::before {
+      content: 'NEW';
+      position: absolute;
+      top: -5px;
+      right: 10px;
+      background: #27ae60;
+      color: white;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      box-shadow: 0 2px 6px rgba(39, 174, 96, 0.3);
+    }
+
+    @keyframes fadeIn {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
     }
 
     .bookmark-header {
@@ -167,6 +216,12 @@
     .timestamp {
       color: #888;
       font-size: 12px;
+      font-weight: 500;
+    }
+
+    .timestamp.recent {
+      color: #27ae60;
+      font-weight: bold;
     }
 
     .bookmark-summary {
@@ -382,10 +437,29 @@
       z-index: 1001;
       transform: translateX(100%);
       transition: transform 0.3s;
+      max-width: 300px;
+      font-size: 14px;
+      font-weight: 500;
     }
 
     .notification.show {
       transform: translateX(0);
+    }
+
+    .notification.success {
+      background: #27ae60;
+    }
+
+    .notification.error {
+      background: #e74c3c;
+    }
+
+    .notification.warning {
+      background: #f39c12;
+    }
+
+    .notification.info {
+      background: #4A90E2;
     }
 
     .hotkey-hint {
@@ -421,6 +495,15 @@
       <div class="search-icon">🔍</div>
     </div>
 
+    <div class="sort-container">
+      <select class="sort-select" id="sortSelect">
+        <option value="newest">📅 Newest First</option>
+        <option value="oldest">📅 Oldest First</option>
+        <option value="title">🔤 By Title</option>
+        <option value="language">💻 By Language</option>
+      </select>
+    </div>
+
     <button class="add-bookmark-btn" id="addBookmarkBtn">+ Add Bookmark</button>
 
     <div class="stats" id="stats">
@@ -431,11 +514,32 @@
     </div>
   </div>
 
-  <div class="main-content">
+  <div class="main-content" id="mainContent">
     <div class="bookmarks-container" id="bookmarksContainer">
       <div class="empty-state" id="emptyState">
         <h3>No bookmarks yet</h3>
-        <p>Start by selecting some code and pressing <kbd>Ctrl+Shift+B</kbd> to bookmark it!</p>
+        <p><strong>Super easy bookmarking:</strong></p>
+        <div style="text-align: left; margin: 20px 0;">
+          <p><strong>🎯 Visual Bookmark Button:</strong></p>
+          <ol style="padding-left: 20px; margin-bottom: 15px;">
+            <li>Select and copy any text/code with <kbd>Ctrl+C</kbd> (or <kbd>Cmd+C</kbd> on Mac)</li>
+            <li>A <strong>bookmark button</strong> will appear near your cursor</li>
+            <li>Click the <strong>📚 Bookmark</strong> button to save it!</li>
+          </ol>
+
+          <p><strong>⚡ Alternative - Quick Hotkey:</strong></p>
+          <ol style="padding-left: 20px; margin-bottom: 15px;">
+            <li>Copy any text/code</li>
+            <li>Press <kbd>Ctrl+Shift+B</kbd> (or <kbd>Cmd+Shift+B</kbd> on Mac)</li>
+          </ol>
+
+          <p><strong>📋 Tray Menu:</strong></p>
+          <ol style="padding-left: 20px;">
+            <li>Right-click the tray icon (📚 in menu bar)</li>
+            <li>Select from your recent clipboard items</li>
+          </ol>
+        </div>
+        <p><em>The app monitors your clipboard and shows a visual bookmark button when you copy text!</em></p>
       </div>
     </div>
   </div>
@@ -485,7 +589,7 @@
 <div class="notification" id="notification"></div>
 
 <div class="hotkey-hint">
-  Press <kbd>Ctrl+Shift+B</kbd> to bookmark selected text
+  Copy text to see the bookmark button appear! Or use <kbd>Ctrl+Shift+B</kbd>/<kbd>Cmd+Shift+B</kbd>
 </div>
 
 <script>
@@ -494,15 +598,33 @@
   let bookmarks = [];
   let currentBookmark = null;
   let isEditMode = false;
+  let currentSort = 'newest';
 
   // Initialize app
   document.addEventListener('DOMContentLoaded', async () => {
     await loadBookmarks();
     setupEventListeners();
+
+    // Listen for bookmark events from main process
+    ipcRenderer.on('bookmark-added', (event, bookmark) => {
+      console.log('New bookmark added:', bookmark);
+      showNotification(`Bookmarked: ${bookmark.title}`, 'success');
+
+      // Add the new bookmark to the beginning of the array
+      bookmarks.unshift(bookmark);
+
+      // Re-display bookmarks with current sort
+      displayBookmarks(sortBookmarks(bookmarks, currentSort));
+      updateStats();
+
+      // Scroll to top to show the new bookmark
+      document.getElementById('mainContent').scrollTo({ top: 0, behavior: 'smooth' });
+    });
   });
 
   function setupEventListeners() {
     document.getElementById('searchBox').addEventListener('input', handleSearch);
+    document.getElementById('sortSelect').addEventListener('change', handleSortChange);
     document.getElementById('addBookmarkBtn').addEventListener('click', showAddModal);
 
     // Global keyboard shortcuts
@@ -516,12 +638,85 @@
 
   async function loadBookmarks() {
     try {
+      // Add a small delay to ensure IPC handlers are ready
+      await new Promise(resolve => setTimeout(resolve, 100));
       bookmarks = await ipcRenderer.invoke('get-bookmarks');
+
+      // Sort bookmarks by newest first by default
+      bookmarks = sortBookmarks(bookmarks, currentSort);
+
       displayBookmarks(bookmarks);
       updateStats();
     } catch (error) {
       console.error('Error loading bookmarks:', error);
+      // Retry after a short delay
+      setTimeout(async () => {
+        try {
+          bookmarks = await ipcRenderer.invoke('get-bookmarks');
+          bookmarks = sortBookmarks(bookmarks, currentSort);
+          displayBookmarks(bookmarks);
+          updateStats();
+        } catch (retryError) {
+          console.error('Retry failed:', retryError);
+          // Initialize with empty bookmarks array
+          bookmarks = [];
+          displayBookmarks(bookmarks);
+          updateStats();
+        }
+      }, 1000);
     }
+  }
+
+  function sortBookmarks(bookmarksArray, sortType) {
+    const sorted = [...bookmarksArray];
+
+    switch (sortType) {
+      case 'newest':
+        return sorted.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+      case 'oldest':
+        return sorted.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+      case 'title':
+        return sorted.sort((a, b) => a.title.localeCompare(b.title));
+      case 'language':
+        return sorted.sort((a, b) => a.language.localeCompare(b.language));
+      default:
+        return sorted.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    }
+  }
+
+  function handleSortChange() {
+    currentSort = document.getElementById('sortSelect').value;
+    const sortedBookmarks = sortBookmarks(bookmarks, currentSort);
+    displayBookmarks(sortedBookmarks);
+  }
+
+  function formatTimestamp(timestamp) {
+    const date = new Date(timestamp);
+    const now = new Date();
+    const diffInMinutes = Math.floor((now - date) / (1000 * 60));
+    const diffInHours = Math.floor(diffInMinutes / 60);
+    const diffInDays = Math.floor(diffInHours / 24);
+
+    if (diffInMinutes < 1) {
+      return { text: 'Just now', isRecent: true };
+    } else if (diffInMinutes < 60) {
+      return { text: `${diffInMinutes}m ago`, isRecent: true };
+    } else if (diffInHours < 24) {
+      return { text: `${diffInHours}h ago`, isRecent: diffInHours < 2 };
+    } else if (diffInDays === 1) {
+      return { text: 'Yesterday', isRecent: false };
+    } else if (diffInDays < 7) {
+      return { text: `${diffInDays} days ago`, isRecent: false };
+    } else {
+      return { text: date.toLocaleDateString(), isRecent: false };
+    }
+  }
+
+  function isNewBookmark(timestamp) {
+    const date = new Date(timestamp);
+    const now = new Date();
+    const diffInHours = Math.floor((now - date) / (1000 * 60 * 60));
+    return diffInHours < 1; // Less than 1 hour old
   }
 
   function displayBookmarks(bookmarksToShow) {
@@ -534,27 +729,35 @@
       return;
     }
 
-    container.innerHTML = bookmarksToShow.map(bookmark => `
-                <div class="bookmark-item" onclick="viewBookmark('${bookmark.id}')">
-                    <div class="bookmark-header">
-                        <div class="bookmark-title">${escapeHtml(bookmark.title)}</div>
-                        <div class="bookmark-actions" onclick="event.stopPropagation()">
-                            <button class="action-btn view-btn" onclick="viewBookmark('${bookmark.id}')">View</button>
-                            <button class="action-btn edit-btn" onclick="editBookmark('${bookmark.id}')">Edit</button>
-                            <button class="action-btn copy-btn" onclick="copyBookmark('${bookmark.id}')">Copy</button>
-                            <button class="action-btn delete-btn" onclick="deleteBookmark('${bookmark.id}')">Delete</button>
-                        </div>
-                    </div>
-                    <div class="bookmark-meta">
-                        <span class="language-tag">${bookmark.language.toUpperCase()}</span>
-                        <span class="timestamp">${new Date(bookmark.timestamp).toLocaleDateString()}</span>
-                    </div>
-                    <div class="bookmark-summary">${escapeHtml(bookmark.summary)}</div>
-                    <div class="bookmark-tags">
-                        ${bookmark.tags.map(tag => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}
-                    </div>
-                </div>
-            `).join('');
+    container.innerHTML = bookmarksToShow.map((bookmark, index) => {
+      const timestampInfo = formatTimestamp(bookmark.timestamp);
+      const isNewest = index === 0 && currentSort === 'newest';
+      const isNew = isNewBookmark(bookmark.timestamp);
+
+      return `
+        <div class="bookmark-item ${isNewest ? 'newest' : ''} ${isNew ? 'new-badge' : ''}"
+             onclick="viewBookmark('${bookmark.id}')"
+             style="animation-delay: ${index * 0.1}s">
+          <div class="bookmark-header">
+            <div class="bookmark-title">${escapeHtml(bookmark.title)}</div>
+            <div class="bookmark-actions" onclick="event.stopPropagation()">
+              <button class="action-btn view-btn" onclick="viewBookmark('${bookmark.id}')">View</button>
+              <button class="action-btn edit-btn" onclick="editBookmark('${bookmark.id}')">Edit</button>
+              <button class="action-btn copy-btn" onclick="copyBookmark('${bookmark.id}')">Copy</button>
+              <button class="action-btn delete-btn" onclick="deleteBookmark('${bookmark.id}')">Delete</button>
+            </div>
+          </div>
+          <div class="bookmark-meta">
+            <span class="language-tag">${bookmark.language.toUpperCase()}</span>
+            <span class="timestamp ${timestampInfo.isRecent ? 'recent' : ''}">${timestampInfo.text}</span>
+          </div>
+          <div class="bookmark-summary">${escapeHtml(bookmark.summary)}</div>
+          <div class="bookmark-tags">
+            ${bookmark.tags.map(tag => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}
+          </div>
+        </div>
+      `;
+    }).join('');
   }
 
   function updateStats() {
@@ -570,9 +773,18 @@
     const query = document.getElementById('searchBox').value;
     try {
       const results = await ipcRenderer.invoke('search-bookmarks', query);
-      displayBookmarks(results);
+      const sortedResults = sortBookmarks(results, currentSort);
+      displayBookmarks(sortedResults);
     } catch (error) {
       console.error('Error searching bookmarks:', error);
+      // Fallback to local search if IPC fails
+      const results = bookmarks.filter(bookmark =>
+          bookmark.title.toLowerCase().includes(query.toLowerCase()) ||
+          bookmark.content.toLowerCase().includes(query.toLowerCase()) ||
+          bookmark.tags.some(tag => tag.toLowerCase().includes(query.toLowerCase()))
+      );
+      const sortedResults = sortBookmarks(results, currentSort);
+      displayBookmarks(sortedResults);
     }
   }
 
@@ -626,7 +838,11 @@
 
     try {
       await ipcRenderer.invoke('delete-bookmark', id);
-      await loadBookmarks();
+      // Remove from local array
+      bookmarks = bookmarks.filter(b => b.id !== id);
+      // Re-display with current sort
+      displayBookmarks(sortBookmarks(bookmarks, currentSort));
+      updateStats();
       showNotification('Bookmark deleted successfully!');
     } catch (error) {
       console.error('Error deleting bookmark:', error);
@@ -652,14 +868,27 @@
           tags: tags.length > 0 ? tags : currentBookmark.tags
         };
         await ipcRenderer.invoke('update-bookmark', updatedBookmark);
+
+        // Update local array
+        const index = bookmarks.findIndex(b => b.id === updatedBookmark.id);
+        if (index !== -1) {
+          bookmarks[index] = updatedBookmark;
+          displayBookmarks(sortBookmarks(bookmarks, currentSort));
+        }
+
         showNotification('Bookmark updated successfully!');
       } else {
-        await ipcRenderer.invoke('add-bookmark', content);
+        const newBookmark = await ipcRenderer.invoke('add-bookmark', content);
+        if (newBookmark) {
+          // Add to beginning of local array
+          bookmarks.unshift(newBookmark);
+          displayBookmarks(sortBookmarks(bookmarks, currentSort));
+        }
         showNotification('Bookmark added successfully!');
       }
 
       closeModal('addModal');
-      await loadBookmarks();
+      updateStats();
     } catch (error) {
       console.error('Error saving bookmark:', error);
       alert('Error saving bookmark. Please try again.');
@@ -685,9 +914,10 @@
     document.getElementById(modalId).style.display = 'none';
   }
 
-  function showNotification(message) {
+  function showNotification(message, type = 'success') {
     const notification = document.getElementById('notification');
     notification.textContent = message;
+    notification.className = `notification ${type}`;
     notification.classList.add('show');
 
     setTimeout(() => {
